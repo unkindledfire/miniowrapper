@@ -1,0 +1,56 @@
+# cargo-deny policy for image_optimizer.
+#
+# This project is deployed as a Windows Server service. The dependency graph is
+# intentionally checked for the Windows MSVC target used by the release build.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Keep vulnerabilities, unsoundness, and yanked crates as hard failures.
+# RUSTSEC-2024-0436 is a current exception: paste 1.0.15 is pulled transitively
+# by ravif -> rav1e and has no safe upgrade path in the current AVIF stack.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "Transitive through ravif/rav1e for AVIF encoding; no safe upgrade currently available. Revisit when ravif/rav1e removes paste or when replacing the AVIF encoder." },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = []
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = [
+    { crate = "getrandom@0.2.17", reason = "Coexists with getrandom 0.3/0.4 through transitive dependencies; harmless duplicate for this binary." },
+    { crate = "thiserror@1.0.69", reason = "Transitive dependencies still use thiserror 1 while others use thiserror 2." },
+    { crate = "thiserror-impl@1.0.69", reason = "Transitive dependency of thiserror 1." },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

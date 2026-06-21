@@ -2,12 +2,15 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
+    fs::Metadata,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -18,7 +21,7 @@ use axum::{
     http::{
         header::{
             ACCEPT, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE,
-            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE, USER_AGENT, VARY,
+            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE, RETRY_AFTER, USER_AGENT, VARY,
         },
         HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri,
     },
@@ -26,7 +29,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use image::{GenericImageView, ImageFormat};
 use reqwest::Client;
 use rgb::AsPixels;
@@ -35,7 +38,7 @@ use tokio::{
     fs,
     io::AsyncWriteExt,
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
@@ -55,16 +58,20 @@ const DEFAULT_WEBP_QUALITY: f32 = 82.0;
 const DEFAULT_CACHE_VERSION: &str = "1";
 const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 3;
 const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_CACHE_CLEANUP_ENABLED: bool = true;
 const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_MAX_AGE_DAYS: u64 = 90;
 const DEFAULT_CACHE_CLEANUP_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_MAX_CONCURRENT_PASSTHROUGH: usize = 256;
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<Config>,
     client: Client,
     encode_limiter: Arc<Semaphore>,
+    transform_limiter: Arc<Semaphore>,
+    passthrough_limiter: Arc<Semaphore>,
     in_flight_encodes: Arc<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     temp_file_counter: Arc<AtomicU64>,
 }
@@ -82,12 +89,16 @@ struct Config {
     cache_version: String,
     enable_accept_negotiation: bool,
     max_concurrent_encodes: usize,
+    max_concurrent_transforms: usize,
+    max_concurrent_passthrough: usize,
     upstream_connect_timeout: Duration,
     upstream_request_timeout: Duration,
+    upstream_stream_idle_timeout: Duration,
     cache_cleanup_enabled: bool,
     cache_max_bytes: u64,
     cache_max_age: Duration,
     cache_cleanup_interval: Duration,
+    public_path_prefixes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -138,6 +149,11 @@ struct EncodeFlightGuard {
     _guard: OwnedMutexGuard<()>,
 }
 
+struct PermitStream<S> {
+    inner: S,
+    _permit: OwnedSemaphorePermit,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _log_guard = init_logging()?;
@@ -150,13 +166,15 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(cfg.upstream_connect_timeout)
-        .timeout(cfg.upstream_request_timeout)
+        .read_timeout(cfg.upstream_stream_idle_timeout)
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
         .context("failed to build reqwest client")?;
 
     let state = AppState {
         encode_limiter: Arc::new(Semaphore::new(cfg.max_concurrent_encodes)),
+        transform_limiter: Arc::new(Semaphore::new(cfg.max_concurrent_transforms)),
+        passthrough_limiter: Arc::new(Semaphore::new(cfg.max_concurrent_passthrough)),
         in_flight_encodes: Arc::new(StdMutex::new(HashMap::new())),
         temp_file_counter: Arc::new(AtomicU64::new(0)),
         cfg: cfg.clone(),
@@ -179,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
         cache_dir = %cfg.cache_dir.display(),
         max_transform_bytes = cfg.max_transform_bytes,
         max_concurrent_encodes = cfg.max_concurrent_encodes,
+        max_concurrent_transforms = cfg.max_concurrent_transforms,
+        max_concurrent_passthrough = cfg.max_concurrent_passthrough,
         accept_negotiation = cfg.enable_accept_negotiation,
         cache_cleanup_enabled = cfg.cache_cleanup_enabled,
         "image optimizer started"
@@ -237,6 +257,9 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response<
     match method {
         Method::GET => handle_get(state, uri, headers, started).await,
         Method::HEAD => {
+            if !is_public_object_request(&uri, &state.cfg) {
+                return response_with_status(StatusCode::NOT_FOUND, "not found");
+            }
             let upstream_uri = uri_with_query(&uri, strip_format_query_raw(uri.query()).as_deref());
             proxy_upstream(state, &Method::HEAD, &upstream_uri, &headers).await
         }
@@ -250,6 +273,10 @@ async fn handle_get(
     headers: HeaderMap,
     started: Instant,
 ) -> Response<Body> {
+    if !is_public_object_request(&uri, &state.cfg) {
+        return response_with_status(StatusCode::NOT_FOUND, "not found");
+    }
+
     let Some(decision) = decide_transform(&uri, &headers, &state.cfg) else {
         let upstream_uri = uri_with_query(&uri, strip_format_query_raw(uri.query()).as_deref());
         return proxy_upstream(state, &Method::GET, &upstream_uri, &headers).await;
@@ -283,9 +310,17 @@ async fn handle_get(
         return cached_file_response(file, decision.target).await;
     }
 
+    let transform_permit = match state.transform_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(path = %uri, "transform queue is full");
+            return busy_response();
+        }
+    };
+
     let upstream_uri = uri_with_query(&uri, decision.upstream_query.as_deref());
     let upstream_response =
-        match fetch_upstream(&state, &Method::GET, &upstream_uri, &headers).await {
+        match fetch_upstream(&state, &Method::GET, &upstream_uri, &headers, true).await {
             Ok(response) => response,
             Err(err) => {
                 error!(path = %uri, error = %err, "upstream request failed");
@@ -294,7 +329,7 @@ async fn handle_get(
         };
 
     if !upstream_response.status().is_success() {
-        return reqwest_response_to_axum(upstream_response, false).await;
+        return reqwest_response_to_axum(upstream_response, false, None).await;
     }
 
     if should_skip_for_size(upstream_response.headers(), state.cfg.max_transform_bytes) {
@@ -303,7 +338,8 @@ async fn handle_get(
             max_transform_bytes = state.cfg.max_transform_bytes,
             "source image too large for transform; streaming original"
         );
-        return reqwest_response_to_axum(upstream_response, true).await;
+        drop(transform_permit);
+        return proxy_upstream(state, &Method::GET, &upstream_uri, &headers).await;
     }
 
     let source_headers = upstream_response.headers().clone();
@@ -315,6 +351,7 @@ async fn handle_get(
                 max_transform_bytes = state.cfg.max_transform_bytes,
                 "source image exceeded transform limit while reading; refetching original"
             );
+            drop(transform_permit);
             return proxy_upstream(state, &Method::GET, &upstream_uri, &headers).await;
         }
         Err(ReadBodyError::Request(err)) => {
@@ -344,6 +381,7 @@ async fn handle_get(
         encode_image(&source_for_encode, target, &cfg)
     })
     .await;
+    drop(transform_permit);
 
     let converted = match converted {
         Ok(Ok(bytes)) => bytes,
@@ -354,11 +392,11 @@ async fn handle_get(
                 error = %err,
                 "[Convert Failed]; returning original"
             );
-            return original_bytes_response(source_headers, source_bytes);
+            return original_bytes_response_no_store(source_headers, source_bytes);
         }
         Err(err) => {
             error!(path = %uri, error = %err, "encoder task failed");
-            return original_bytes_response(source_headers, source_bytes);
+            return original_bytes_response_no_store(source_headers, source_bytes);
         }
     };
 
@@ -389,6 +427,14 @@ fn response_with_status(status: StatusCode, body: &'static str) -> Response<Body
         .status(status)
         .body(Body::from(body))
         .expect("static response is valid")
+}
+
+fn busy_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(RETRY_AFTER, "5")
+        .body(Body::from("service busy"))
+        .expect("busy response is valid")
 }
 
 async fn acquire_encode_flight(state: &AppState, key: String) -> EncodeFlightGuard {
@@ -426,14 +472,33 @@ impl Drop for EncodeFlightGuard {
     }
 }
 
+impl<S> Stream for PermitStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
 async fn proxy_upstream(
     state: AppState,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    match fetch_upstream(&state, method, uri, headers).await {
-        Ok(response) => reqwest_response_to_axum(response, true).await,
+    let permit = match state.passthrough_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(path = %uri, "passthrough queue is full");
+            return busy_response();
+        }
+    };
+
+    match fetch_upstream(&state, method, uri, headers, false).await {
+        Ok(response) => reqwest_response_to_axum(response, true, Some(permit)).await,
         Err(err) => {
             error!(path = %uri, error = %err, "upstream request failed");
             response_with_status(StatusCode::BAD_GATEWAY, "bad gateway")
@@ -446,11 +511,20 @@ async fn fetch_upstream(
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
+    bounded_request: bool,
 ) -> anyhow::Result<reqwest::Response> {
     let upstream_url = build_upstream_url(&state.cfg.upstream_base, uri)?;
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .context("failed to convert HTTP method")?;
-    let mut request = state.client.request(reqwest_method, upstream_url);
+    let timeout = if bounded_request {
+        state.cfg.upstream_request_timeout
+    } else {
+        state.cfg.upstream_stream_idle_timeout
+    };
+    let mut request = state
+        .client
+        .request(reqwest_method, upstream_url)
+        .timeout(timeout);
 
     for name in forwarded_request_headers() {
         if let Some(value) = headers.get(name) {
@@ -464,7 +538,11 @@ async fn fetch_upstream(
         .context("failed to send upstream request")
 }
 
-async fn reqwest_response_to_axum(response: reqwest::Response, streaming: bool) -> Response<Body> {
+async fn reqwest_response_to_axum(
+    response: reqwest::Response,
+    streaming: bool,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Response<Body> {
     let status = response.status();
     let headers = response.headers().clone();
     let mut builder = Response::builder().status(status);
@@ -474,9 +552,18 @@ async fn reqwest_response_to_axum(response: reqwest::Response, streaming: bool) 
         let stream = response
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
-        builder
-            .body(Body::from_stream(stream))
-            .expect("stream response is valid")
+        if let Some(permit) = permit {
+            builder
+                .body(Body::from_stream(PermitStream {
+                    inner: stream,
+                    _permit: permit,
+                }))
+                .expect("stream response is valid")
+        } else {
+            builder
+                .body(Body::from_stream(stream))
+                .expect("stream response is valid")
+        }
     } else {
         match response.bytes().await {
             Ok(bytes) => builder
@@ -526,6 +613,52 @@ fn forwarded_request_headers() -> &'static [HeaderName] {
             IF_RANGE,
             USER_AGENT,
         ]
+    })
+}
+
+fn is_public_object_request(uri: &Uri, cfg: &Config) -> bool {
+    let path = uri.path();
+    if path == "/" || path.ends_with('/') || path.contains('\\') {
+        return false;
+    }
+    if !cfg.public_path_prefixes.is_empty()
+        && !cfg
+            .public_path_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    {
+        return false;
+    }
+    if has_blocked_s3_control_query(uri.query()) {
+        return false;
+    }
+    true
+}
+
+fn has_blocked_s3_control_query(query: Option<&str>) -> bool {
+    parse_query(query).iter().any(|(key, _)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "list-type"
+                | "uploads"
+                | "uploadid"
+                | "delete"
+                | "acl"
+                | "policy"
+                | "location"
+                | "versioning"
+                | "versions"
+                | "tagging"
+                | "torrent"
+                | "website"
+                | "cors"
+                | "lifecycle"
+                | "replication"
+                | "notification"
+                | "object-lock"
+                | "retention"
+                | "legal-hold"
+        )
     })
 }
 
@@ -836,12 +969,13 @@ fn converted_response(bytes: Bytes, target: TargetFormat) -> Response<Body> {
         .expect("converted response is valid")
 }
 
-fn original_bytes_response(headers: HeaderMap, bytes: Bytes) -> Response<Body> {
+fn original_bytes_response_no_store(headers: HeaderMap, bytes: Bytes) -> Response<Body> {
     let mut builder = Response::builder().status(StatusCode::OK);
     {
         let target_headers = builder.headers_mut().expect("headers exist");
         copy_response_headers(target_headers, &headers, false);
         target_headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        target_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     builder
         .body(Body::from(bytes))
@@ -957,6 +1091,10 @@ async fn collect_cache_files_for_format(
                     continue;
                 }
             };
+            if is_reparse_point_or_symlink(&metadata) {
+                warn!(path = %path.display(), "skipping cache reparse point or symlink");
+                continue;
+            }
 
             if metadata.is_dir() {
                 pending.push(path);
@@ -982,8 +1120,45 @@ fn is_cache_managed_file(path: &Path, extension: &str) -> bool {
     let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
-    let expected_suffix = format!(".{extension}");
-    file_name.ends_with(&expected_suffix) || file_name.contains(".tmp-")
+    if let Some(digest) = file_name.strip_suffix(&format!(".{extension}")) {
+        return is_hex_digest(digest);
+    }
+
+    let Some((prefix, suffix)) = file_name.split_once(&format!(".{extension}.tmp-")) else {
+        return false;
+    };
+    if !is_hex_digest(prefix) {
+        return false;
+    }
+    let mut parts = suffix.split('-');
+    let Some(pid) = parts.next() else {
+        return false;
+    };
+    let Some(sequence) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.chars().all(|ch| ch.is_ascii_digit())
+        && sequence.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+#[cfg(windows)]
+fn is_reparse_point_or_symlink(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point_or_symlink(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn is_older_than(modified: SystemTime, now: SystemTime, max_age: Duration) -> bool {
@@ -1019,6 +1194,12 @@ impl Config {
             .map(|n| std::cmp::max(1, n.get() / 2))
             .unwrap_or(1);
         let max_concurrent_encodes = parse_env_usize("MAX_CONCURRENT_ENCODES", default_encodes)?;
+        let max_concurrent_transforms =
+            parse_env_usize("MAX_CONCURRENT_TRANSFORMS", max_concurrent_encodes)?;
+        let max_concurrent_passthrough = parse_env_usize(
+            "MAX_CONCURRENT_PASSTHROUGH",
+            DEFAULT_MAX_CONCURRENT_PASSTHROUGH,
+        )?;
         let upstream_connect_timeout = Duration::from_secs(parse_env_nonzero_u64(
             "UPSTREAM_CONNECT_TIMEOUT_SECS",
             DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
@@ -1026,6 +1207,10 @@ impl Config {
         let upstream_request_timeout = Duration::from_secs(parse_env_nonzero_u64(
             "UPSTREAM_REQUEST_TIMEOUT_SECS",
             DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS,
+        )?);
+        let upstream_stream_idle_timeout = Duration::from_secs(parse_env_nonzero_u64(
+            "UPSTREAM_STREAM_IDLE_TIMEOUT_SECS",
+            DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
         )?);
         let cache_cleanup_enabled =
             parse_env_bool("CACHE_CLEANUP_ENABLED", DEFAULT_CACHE_CLEANUP_ENABLED)?;
@@ -1038,6 +1223,7 @@ impl Config {
             "CACHE_CLEANUP_INTERVAL_SECS",
             DEFAULT_CACHE_CLEANUP_INTERVAL_SECS,
         )?);
+        let public_path_prefixes = parse_public_path_prefixes()?;
 
         Ok(Self {
             listen_addr,
@@ -1051,12 +1237,16 @@ impl Config {
             cache_version,
             enable_accept_negotiation,
             max_concurrent_encodes,
+            max_concurrent_transforms,
+            max_concurrent_passthrough,
             upstream_connect_timeout,
             upstream_request_timeout,
+            upstream_stream_idle_timeout,
             cache_cleanup_enabled,
             cache_max_bytes,
             cache_max_age,
             cache_cleanup_interval,
+            public_path_prefixes,
         })
     }
 }
@@ -1124,6 +1314,22 @@ fn parse_env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
+fn parse_public_path_prefixes() -> anyhow::Result<Vec<String>> {
+    let Ok(raw) = env::var("PUBLIC_PATH_PREFIXES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if !value.starts_with('/') {
+                return Err(anyhow!("PUBLIC_PATH_PREFIXES entries must start with /"));
+            }
+            Ok(value.to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,24 +1352,33 @@ mod tests {
             cache_version: DEFAULT_CACHE_VERSION.to_string(),
             enable_accept_negotiation,
             max_concurrent_encodes: 1,
+            max_concurrent_transforms: 1,
+            max_concurrent_passthrough: DEFAULT_MAX_CONCURRENT_PASSTHROUGH,
             upstream_connect_timeout: Duration::from_secs(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS),
             upstream_request_timeout: Duration::from_secs(DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS),
+            upstream_stream_idle_timeout: Duration::from_secs(
+                DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
+            ),
             cache_cleanup_enabled: DEFAULT_CACHE_CLEANUP_ENABLED,
             cache_max_bytes: DEFAULT_CACHE_MAX_BYTES,
             cache_max_age: Duration::from_secs(DEFAULT_CACHE_MAX_AGE_DAYS * 24 * 60 * 60),
             cache_cleanup_interval: Duration::from_secs(DEFAULT_CACHE_CLEANUP_INTERVAL_SECS),
+            public_path_prefixes: Vec::new(),
         }
     }
 
     fn test_state(cfg: Config) -> AppState {
+        let max_concurrent_transforms = cfg.max_concurrent_transforms;
+        let max_concurrent_passthrough = cfg.max_concurrent_passthrough;
         AppState {
             cfg: Arc::new(cfg),
             client: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
             encode_limiter: Arc::new(Semaphore::new(1)),
+            transform_limiter: Arc::new(Semaphore::new(max_concurrent_transforms)),
+            passthrough_limiter: Arc::new(Semaphore::new(max_concurrent_passthrough)),
             in_flight_encodes: Arc::new(StdMutex::new(HashMap::new())),
             temp_file_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -1296,10 +1511,50 @@ mod tests {
 
     #[test]
     fn cache_cleanup_only_manages_target_format_and_tmp_files() {
-        assert!(is_cache_managed_file(Path::new("abc.avif"), "avif"));
-        assert!(is_cache_managed_file(Path::new("abc.avif.tmp-1-2"), "avif"));
+        let digest = "a".repeat(64);
+        assert!(is_cache_managed_file(
+            Path::new(&format!("{digest}.avif")),
+            "avif"
+        ));
+        assert!(is_cache_managed_file(
+            Path::new(&format!("{digest}.avif.tmp-1-2")),
+            "avif"
+        ));
+        assert!(!is_cache_managed_file(Path::new("abc.avif"), "avif"));
+        assert!(!is_cache_managed_file(
+            Path::new("abc.avif.tmp-1-2"),
+            "avif"
+        ));
         assert!(!is_cache_managed_file(Path::new("abc.jpg"), "avif"));
         assert!(!is_cache_managed_file(Path::new("notes.txt"), "webp"));
+    }
+
+    #[test]
+    fn public_object_policy_rejects_control_queries_and_directories() {
+        let mut cfg = test_config(false);
+        assert!(is_public_object_request(
+            &"/bucket/a.jpg?v=1".parse().unwrap(),
+            &cfg
+        ));
+        assert!(!is_public_object_request(&"/".parse().unwrap(), &cfg));
+        assert!(!is_public_object_request(
+            &"/bucket/".parse().unwrap(),
+            &cfg
+        ));
+        assert!(!is_public_object_request(
+            &"/bucket?list-type=2".parse().unwrap(),
+            &cfg
+        ));
+
+        cfg.public_path_prefixes = vec!["/blog/".to_string()];
+        assert!(is_public_object_request(
+            &"/blog/a.jpg".parse().unwrap(),
+            &cfg
+        ));
+        assert!(!is_public_object_request(
+            &"/private/a.jpg".parse().unwrap(),
+            &cfg
+        ));
     }
 
     #[tokio::test]
@@ -1368,8 +1623,81 @@ mod tests {
             response.headers().get(CONTENT_TYPE).unwrap(),
             HeaderValue::from_static("image/jpeg")
         );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"not an actual image");
+    }
+
+    #[tokio::test]
+    async fn transform_queue_full_returns_busy_before_upstream() {
+        let (upstream, _handle) =
+            spawn_mock_upstream(Router::new().fallback(any(|| async { "unexpected" }))).await;
+        let mut cfg = test_config(false);
+        cfg.upstream_base = Url::parse(&upstream).unwrap();
+        cfg.max_concurrent_transforms = 0;
+        let app = build_router(test_state(cfg));
+
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/bucket/a.jpg?format=webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER).unwrap(),
+            HeaderValue::from_static("5")
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_queue_full_returns_busy_before_upstream() {
+        let (upstream, _handle) =
+            spawn_mock_upstream(Router::new().fallback(any(|| async { "unexpected" }))).await;
+        let mut cfg = test_config(false);
+        cfg.upstream_base = Url::parse(&upstream).unwrap();
+        cfg.max_concurrent_passthrough = 0;
+        let app = build_router(test_state(cfg));
+
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/bucket/a.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn blocked_object_query_is_rejected_before_upstream() {
+        let (upstream, _handle) =
+            spawn_mock_upstream(Router::new().fallback(any(|| async { "unexpected" }))).await;
+        let mut cfg = test_config(false);
+        cfg.upstream_base = Url::parse(&upstream).unwrap();
+        let app = build_router(test_state(cfg));
+
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/bucket?list-type=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
