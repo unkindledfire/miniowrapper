@@ -1,7 +1,7 @@
 # Rust build output
 /target/
+/history/
 /wiki/
-
 # Local runtime output
 /logs/
 *.log
@@ -30,7 +30,7 @@ $RECYCLE.BIN/
 *.dll
 *.exp
 *.lib
-README.md
+*.md
 
 # Editor and IDE folders
 .vscode/
