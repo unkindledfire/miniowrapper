@@ -1,0 +1,48 @@
+# Rust build output
+/target/
+/wiki/
+
+# Local runtime output
+/logs/
+*.log
+*.log.*
+
+# Local image/cache data
+/cache/
+/minio_img_cache/
+
+# Local environment and deployment overrides
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+*.service.local.*
+
+# Windows generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.pdb
+*.exe
+*.dll
+*.exp
+*.lib
+README.md
+
+# Editor and IDE folders
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Rust tooling scratch files
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Keep application lockfile tracked.
+!Cargo.lock
